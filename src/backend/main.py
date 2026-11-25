@@ -16,6 +16,7 @@ from agent import run_workflow, slice_workflow
 from contracts import ARTIFACTS, Contract, JOBS, Slug, WorkflowError, checked_profile, job_dir, profile_manifests, read_json, save_json, snapshot_profile
 
 MAX_UPLOAD = 16 * 1024**2
+MAX_MODELS = 3
 logger = logging.getLogger(__name__)
 
 
@@ -112,11 +113,11 @@ async def prepare(job_id: UUID, slicing: bool = False):
 @app.post("/api/jobs", status_code=202)
 async def create_job(
     background: BackgroundTasks,
-    model: Annotated[UploadFile, File()],
+    model: Annotated[list[UploadFile], File(min_length=1, max_length=MAX_MODELS)],
     profile_id: Annotated[Slug, Form()],
     prompt: Annotated[str, Form(min_length=1, max_length=4000)],
 ):
-    if Path(model.filename or "").suffix.lower() != ".stl":
+    if any(Path(file.filename or "").suffix.lower() != ".stl" for file in model):
         raise HTTPException(415, "Поддерживается STL. Координаты интерпретируются как миллиметры.")
     if not prompt.strip():
         raise HTTPException(422, "Введите пожелания к печати.")
@@ -124,22 +125,25 @@ async def create_job(
     job_id = uuid4()
     folder = job_dir(job_id)
     folder.mkdir()
-    state = {"job_id": str(job_id), "status": "uploading", "revision": 1, "profile_id": profile_id, "prompt": prompt.strip()}
+    names = [(file.filename or "").replace("\\", "/").rsplit("/", 1)[-1][:120] for file in model]
+    state = {
+        "job_id": str(job_id), "status": "uploading", "revision": 1,
+        "profile_id": profile_id, "prompt": prompt.strip(), "models": names,
+    }
     path = folder / "status.json"
     save_json(path, state)
     try:
-        if model.size is not None and model.size > MAX_UPLOAD:
-            raise HTTPException(413, "Лимит загрузки STL составляет 16 МиБ.")
-        source = folder / "source.stl"
-        total = 0
-        with source.open("wb") as stream:
-            while chunk := await model.read(256 * 1024):
-                total += len(chunk)
-                if total > MAX_UPLOAD:
-                    raise HTTPException(413, "Лимит загрузки STL составляет 16 МиБ.")
-                stream.write(chunk)
-        if total == 0:
-            raise HTTPException(422, "Файл STL пуст.")
+        for index, file in enumerate(model):
+            source = folder / ("source.stl" if index == 0 else f"source-{index + 1}.stl")
+            total = 0
+            with source.open("wb") as stream:
+                while chunk := await file.read(256 * 1024):
+                    total += len(chunk)
+                    if total > MAX_UPLOAD:
+                        raise HTTPException(413, "Лимит одного STL составляет 16 МиБ.")
+                    stream.write(chunk)
+            if total == 0:
+                raise HTTPException(422, "Один из файлов STL пуст.")
         revision_folder = folder / "rev-1"
         revision_folder.mkdir()
         await run_in_threadpool(snapshot_profile, profile_id, revision_folder / "profile")
@@ -147,11 +151,13 @@ async def create_job(
         save_json(path, {**state, "status": "failed", "error": {"code": exc.code, "message": str(exc)}})
         raise HTTPException(422, {"code": exc.code, "message": str(exc)}) from exc
     except HTTPException as exc:
-        (folder / "source.stl").unlink(missing_ok=True)
+        for source in folder.glob("source*.stl"):
+            source.unlink()
         save_json(path, {**state, "status": "failed", "error": {"code": "UPLOAD_REJECTED", "message": exc.detail}})
         raise
     finally:
-        await model.close()
+        for file in model:
+            await file.close()
     state["status"] = "queued"
     save_json(path, state)
     background.add_task(prepare, job_id)

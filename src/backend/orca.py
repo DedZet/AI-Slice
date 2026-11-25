@@ -1,9 +1,12 @@
 """Write plate-space geometry and run a locally installed OrcaSlicer."""
+import json
+import math
 import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
+from xml.etree import ElementTree
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 
 from contracts import WorkflowError, load_profile
@@ -13,7 +16,7 @@ CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
 PROGRAM_FILES_KEYS = ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)")
 
 
-def write_plate(path, mesh):
+def write_plate(path, meshes):
     with ZipFile(path, "w", ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", (
             '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
@@ -28,16 +31,19 @@ def write_plate(path, mesh):
             '</Relationships>'
         ))
         with archive.open("3D/3dmodel.model", "w") as model:
-            model.write(
-                f'<model xmlns="{CORE}" unit="millimeter"><resources><object id="1" type="model">'
-                '<mesh><vertices>'.encode()
-            )
-            for x, y, z in mesh.vertices:
-                model.write(f'<vertex x="{x:.12g}" y="{y:.12g}" z="{z:.12g}"/>'.encode())
-            model.write(b"</vertices><triangles>")
-            for a, b, c in mesh.faces:
-                model.write(f'<triangle v1="{a}" v2="{b}" v3="{c}"/>'.encode())
-            model.write(b'</triangles></mesh></object></resources><build><item objectid="1"/></build></model>')
+            model.write(f'<model xmlns="{CORE}" unit="millimeter"><resources>'.encode())
+            for number, mesh in enumerate(meshes, 1):
+                model.write(f'<object id="{number}" type="model" name="AI-SLICE {number}"><mesh><vertices>'.encode())
+                for x, y, z in mesh.vertices:
+                    model.write(f'<vertex x="{x:.12g}" y="{y:.12g}" z="{z:.12g}"/>'.encode())
+                model.write(b"</vertices><triangles>")
+                for a, b, c in mesh.faces:
+                    model.write(f'<triangle v1="{a}" v2="{b}" v3="{c}"/>'.encode())
+                model.write(b"</triangles></mesh></object>")
+            model.write(b"</resources><build>")
+            for number in range(1, len(meshes) + 1):
+                model.write(f'<item objectid="{number}"/>'.encode())
+            model.write(b"</build></model>")
 
 
 def metrics(path):
@@ -92,7 +98,34 @@ def find_orca() -> Path:
     )
 
 
-def run_orca(folder, variant_id):
+def validate_batch(archive, model_count, profile):
+    try:
+        plate = json.loads(archive.read("Metadata/plate_1.json"))
+        report = ElementTree.fromstring(archive.read("Metadata/slice_info.config"))
+        flags = [
+            entry.get("value") for entry in report.findall("./plate/metadata")
+            if entry.get("key") == "outside"
+        ]
+        left, bottom, right, top = plate["bbox_all"]
+        x, y = profile.bed_origin_mm
+        width, depth, _ = profile.bed_size_mm
+        valid = (
+            len(plate["bbox_objects"]) == model_count
+            and plate["is_seq_print"] is False and flags == ["false"]
+            and all(math.isfinite(value) for value in (left, bottom, right, top))
+            and x - .05 <= left <= right <= x + width + .05
+            and y - .05 <= bottom <= top <= y + depth + .05
+        )
+    except (KeyError, ValueError, TypeError, ElementTree.ParseError):
+        valid = False
+    if not valid:
+        raise WorkflowError(
+            "ORCA_INVALID_PLATE",
+            "OrcaSlicer не подтвердил, что все детали помещаются на одной пластине и печатаются по слоям.",
+        )
+
+
+def run_orca(folder, variant_id, *, model_count=1):
     executable = find_orca()
     output = folder / "output"
     output.mkdir(exist_ok=True)
@@ -107,9 +140,11 @@ def run_orca(folder, variant_id):
         "--datadir", "orca-data", "--arrange", "0", "--orient", "0",
         "--slice", "0", "--outputdir", "output", "--export-3mf", archive_path.name,
     ]
-    bed_type = load_profile(folder / "profile").bed_type
-    if bed_type:
-        args.append(f"--curr-bed-type={bed_type}")
+    profile = load_profile(folder / "profile")
+    if profile.bed_type:
+        args.append(f"--curr-bed-type={profile.bed_type}")
+    if model_count > 1:
+        args.append("--print-sequence=by layer")
     try:
         with (folder / "orca.log").open("wb") as log:
             result = subprocess.run(
@@ -131,6 +166,8 @@ def run_orca(folder, variant_id):
             entries = [item for item in archive.infolist() if item.filename.lower().endswith(".gcode")]
             if len(entries) != 1 or not 0 < entries[0].file_size <= 512 * 1024**2:
                 raise ValueError("Expected one nonempty plate G-code")
+            if model_count > 1:
+                validate_batch(archive, model_count, profile)
             with archive.open(entries[0]) as source, gcode_path.open("wb") as sink:
                 shutil.copyfileobj(source, sink)
     except (BadZipFile, OSError, ValueError) as exc:

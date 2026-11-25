@@ -17,7 +17,13 @@ type Result = {
     printer?: string
     material?: string
     bed_type?: string | null
-    orientation: { id: string; contact_mm2: number; overhang_mm2: number }
+    orientation: {
+      id: string; contact_mm2: number; overhang_mm2: number
+      minimum_gap_mm?: number
+      parts?: { model_id: number; name: string; yaw_deg: number; contact_mm2: number; overhang_mm2: number }[]
+    }
+    bed_origin_mm?: [number, number]
+    bed_size_mm?: [number, number, number]
     variant: { id: string; infill_pct: number; supports: 'none' | 'tree' }
     settings?: {
       layer_height?: string | null
@@ -32,6 +38,7 @@ type Result = {
 type Job = {
   job_id: string
   profile_id: string
+  models?: string[]
   revision: number
   history?: ChatMessage[]
   status: Status
@@ -80,6 +87,7 @@ function ProfileOptions({ profiles }: { profiles: Profile[] }) {
 
 function PrintReport({ result, jobId }: { result: Result; jobId: string }) {
   const { metrics, project, geometry } = result
+  const { parts, minimum_gap_mm: gap } = project.orientation
   return (
     <section className="report" aria-label="Отчёт подготовки">
       <h2>{result.revision ? `План печати · версия ${result.revision}` : 'Результат подготовки'}</h2>
@@ -87,7 +95,8 @@ function PrintReport({ result, jobId }: { result: Result; jobId: string }) {
       {result.mode === 'local' && <p>Локальный режим. Параметры выбраны по геометрии и распознанным пожеланиям.</p>}
       {result.message && <p>{result.message}</p>}
       {result.revision && <Suspense fallback={<p>Загрузка 3D-предпросмотра…</p>}>
-        <ModelPreview key={result.revision} url={`/api/jobs/${jobId}/preview/${result.revision}.stl`} />
+        <ModelPreview key={result.revision} url={`/api/jobs/${jobId}/preview/${result.revision}.stl`}
+          bedOrigin={parts ? project.bed_origin_mm : undefined} bedSize={parts ? project.bed_size_mm : undefined} />
       </Suspense>}
       <dl className="metrics">
         {metrics && <><div><dt>Время печати</dt><dd><Measure value={metrics.estimated_seconds === null ? null : metrics.estimated_seconds / 60} unit="мин" /></dd></div>
@@ -105,6 +114,15 @@ function PrintReport({ result, jobId }: { result: Result; jobId: string }) {
         <div><dt>Мин. толщина в выборке</dt><dd><Measure value={geometry.min_sampled_wall_mm} unit="мм" /></dd></div>
         {result.bridge.max_sampled_bridge_mm !== null && <div><dt>Пролёт моста в выборке</dt><dd><Measure value={result.bridge.max_sampled_bridge_mm} unit="мм" /></dd></div>}
       </dl>
+      {parts && <details>
+        <summary>{parts.length} детали на одном столе · минимальный зазор {gap} мм</summary>
+        <ul>{parts.map(part => (
+          <li key={part.model_id}>
+            {part.name} · доворот на столе {part.yaw_deg}° · контакт <Measure value={part.contact_mm2} unit="мм²" />
+            {' · нависания '}<Measure value={part.overhang_mm2} unit="мм²" />
+          </li>
+        ))}</ul>
+      </details>}
       {result.slice_warning && <p>{result.slice_warning}</p>}
       {result.risks.length > 0 && <ul>{result.risks.map(risk => <li key={risk}>{risk}</li>)}</ul>}
     </section>
@@ -160,6 +178,10 @@ export default function App() {
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = new FormData(event.currentTarget)
+    if (form.getAll('model').length > 3) {
+      setError('Для одной пластины выберите до трёх файлов STL.')
+      return
+    }
     setPending(true)
     setError('')
     try {
@@ -196,11 +218,14 @@ export default function App() {
           <p className={message.role === 'user' ? 'user-message' : 'assistant-message'} key={index}>{message.content}</p>
         ))}
         <p className="user-message">{job.prompt}</p>
+        {job.models && job.models.length > 1 && <p>Файлы STL · {job.models.join(', ')}</p>}
         {live && <p role="status">{job.step ? stages[job.step] : 'Задача в очереди'}</p>}
         {job.error && <p role="alert">{job.error.message} ({job.error.code})</p>}
         {job.result && (job.result.revision === job.revision || job.status === 'approved') && <PrintReport result={job.result} jobId={job.job_id} />}
         {job.status === 'review' && job.result?.revision === job.revision && <button type="button" disabled={pending} onClick={() => void update('approve')}>Подтвердить и нарезать</button>}
-        {((job.status === 'review' && job.result?.revision === job.revision) || (job.status === 'failed' && job.revision > 1)) && (
+        {((job.status === 'review' && job.result?.revision === job.revision) ||
+          (job.status === 'failed' && (job.revision > 1 ||
+            ['DOES_NOT_FIT', 'PLATE_LAYOUT_NOT_FOUND', 'SUPPORT_REQUIRED'].includes(job.error?.code ?? '')))) && (
           <form className="revision-form" key={job.revision} onSubmit={event => {
             event.preventDefault()
             const form = new FormData(event.currentTarget)
@@ -232,7 +257,9 @@ export default function App() {
               <ProfileOptions profiles={profiles} />
             </select>
           </label>
-          <label>Модель STL в миллиметрах<input type="file" name="model" accept=".stl" required /></label>
+          <label>Модели STL в миллиметрах · до 3 на одну пластину
+            <input type="file" name="model" accept=".stl" multiple required />
+          </label>
           <label>Пожелания к печати
             <textarea name="prompt" rows={3} maxLength={4000} required
               placeholder="Например, нужна прочность вдоль оси X. Предпочтительное заполнение — 25%." />

@@ -6,10 +6,19 @@ import {
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { STLLoader } from 'three/addons/loaders/STLLoader.js'
 
-export default function ModelPreview({ url }: { url: string }) {
+type PreviewProps = {
+  url: string
+  bedOrigin?: [number, number]
+  bedSize?: [number, number, number]
+}
+
+export default function ModelPreview({ url, bedOrigin, bedSize }: PreviewProps) {
   const host = useRef<HTMLDivElement>(null)
   const [error, setError] = useState('')
   const [ready, setReady] = useState(false)
+  const [bedX, bedY] = bedOrigin ?? [0, 0]
+  const [bedWidth, bedDepth] = bedSize ?? [0, 0]
+  const hasBed = bedWidth > 0 && bedDepth > 0
 
   useEffect(() => {
     const element = host.current
@@ -36,11 +45,11 @@ export default function ModelPreview({ url }: { url: string }) {
     camera.position.set(2.1, -2.8, 1.9)
     const controls = new OrbitControls(camera, renderer.domElement)
     controls.enableDamping = true
-    controls.minDistance = .4
+    controls.minDistance = hasBed ? .03 : .4
     controls.maxDistance = 10
     controls.target.set(0, 0, .35)
     controls.update()
-    const grid = new GridHelper(3, 18, 0x719486, 0xa9c0b4)
+    const grid = new GridHelper(hasBed ? 1 : 3, 18, 0x719486, 0xa9c0b4)
     grid.rotation.x = Math.PI / 2
     grid.position.z = -.003
     scene.add(grid)
@@ -69,7 +78,13 @@ export default function ModelPreview({ url }: { url: string }) {
       const box = geometry.boundingBox ?? new Box3()
       const center = box.getCenter(new Vector3())
       const size = box.getSize(new Vector3())
-      const scale = 1 / Math.max(size.x, size.y, size.z, .001)
+      const scale = 1 / Math.max(size.x, size.y, size.z, bedWidth, bedDepth, .001)
+      if (hasBed) {
+        center.x = bedX + bedWidth / 2
+        center.y = bedY + bedDepth / 2
+        grid.scale.set(bedWidth * scale, 1, bedDepth * scale)
+        camera.position.set(1.35, -1.8, 1.55)
+      }
       geometry.translate(-center.x, -center.y, -box.min.z)
       geometry.scale(scale, scale, scale)
       mesh = new Mesh(geometry, material)
@@ -91,13 +106,13 @@ export default function ModelPreview({ url }: { url: string }) {
       renderer.dispose()
       renderer.domElement.remove()
     }
-  }, [url])
+  }, [url, bedX, bedY, bedWidth, bedDepth, hasBed])
 
   return (
     <figure className="preview">
       <div ref={host} className="preview-canvas" />
       <figcaption>
-        {error || (ready ? 'Перетаскивайте, чтобы вращать, и прокручивайте, чтобы приблизить. Показана ориентация детали на столе до построения поддержек и траекторий.' : 'Загрузка 3D-модели…')}
+        {error || (ready ? 'Перетаскивайте, чтобы вращать, и прокручивайте, чтобы приблизить. Показано размещение на столе до построения поддержек и траекторий.' : 'Загрузка 3D-модели…')}
       </figcaption>
     </figure>
   )

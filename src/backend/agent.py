@@ -17,11 +17,16 @@ STEPS = ("inspect_model", "analyze_orientations", "set_parameters", "preview_mod
 def local_arguments(step, results, variants, prompt, previous):
     text = prompt.lower()
     if step == "analyze_orientations":
+        args = {"load_model_xyz": previous["load_model_xyz"], "priority": previous.get("layout_priority", "balanced")} if previous else {}
         direction = re.search(r"(?:вдоль|по оси)\s*(?:оси\s*)?([xyzхуз])\b", text)
         if direction:
             axis = "xyz".index(direction[1].translate(str.maketrans("хуз", "xyz")))
-            return {"load_model_xyz": [int(index == axis) for index in range(3)]}
-        return {"load_model_xyz": previous["load_model_xyz"]} if previous else {}
+            args["load_model_xyz"] = [int(index == axis) for index in range(3)]
+        if re.search(r"без поддерж|меньше поддерж|минимум поддерж|эконом\w* пластик", text):
+            args["priority"] = "min-support"
+        elif re.search(r"устойчив|держалась|над[её]жнее\s+на столе", text):
+            args["priority"] = "stability"
+        return args
     if step != "set_parameters":
         return {}
     priority = previous["variant"]["priority"] if previous else "balanced"
@@ -74,19 +79,23 @@ def local_arguments(step, results, variants, prompt, previous):
                 "speed": "Меньше проходов за счёт более высокого слоя и меньшего заполнения.",
                 "balanced": "Средние значения высоты слоя и заполнения.",
             }
+            layout = ""
+            if "parts" in pose:
+                layout = " На одной пластине размещено деталей: " + str(len(pose["parts"])) + "."
             return {
                 "orientation_id": pose["id"], "variant_id": variant.id,
                 "rationale": f"Выбран вариант «{variant.id}» с заполнением {variant.infill_pct}%, "
                 f"поддержки {supports}. Контакт со столом {pose['contact_mm2']:.1f} мм². "
-                f"{reasons[variant.priority]} Ориентация выбрана по геометрической оценке.{change}",
+                f"{reasons[variant.priority]} Ориентация выбрана по геометрической оценке.{layout}{change}",
             }
     raise WorkflowError("SUPPORT_REQUIRED", "Нет подходящего варианта профиля с поддержками.")
 
 
-async def ask(client, messages, spec=None):
+async def ask(client, messages, spec=None, tool_choice="auto"):
     data = {"model": os.environ["LLM_MODEL"], "messages": messages}
     if spec:
-        data.update(tools=[spec], tool_choice={"type": "function", "function": {"name": spec["function"]["name"]}})
+        choice = {"type": "function", "function": {"name": spec["function"]["name"]}} if tool_choice == "named" else "auto"
+        data.update(tools=[spec], tool_choice=choice)
     try:
         response = await client.post("chat/completions", json=data)
         response.raise_for_status()
@@ -129,14 +138,20 @@ async def run_workflow(job_id, folder, revision, prompt, progress, previous=None
     transport = worker_transport(job_id, revision)
     mode = os.getenv("LLM_MODE", "local")
     enabled = mode == "api"
+    tool_choice = os.getenv("LLM_TOOL_CHOICE", "auto")
     if mode not in {"local", "api"} or (enabled and not all(
         os.getenv(key) for key in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL")
     )):
         raise WorkflowError("LLM_NOT_CONFIGURED", "Проверьте конфигурацию провайдера LLM.")
+    if enabled and tool_choice not in {"auto", "named"}:
+        raise WorkflowError("LLM_NOT_CONFIGURED", "LLM_TOOL_CHOICE должен иметь значение auto или named.")
     messages = [
         {"role": "system", "content": (
             "Помоги подготовить FDM-печать. Используй текущий инструмент. "
             "Выбирай только измеренные ориентации и утверждённые варианты. "
+            "Для партии выбирай приоритет раскладки по пожеланиям пользователя. "
+            "Координаты и зазоры для всей пластины вычисляет MCP, выбирай только возвращённый ID раскладки. "
+            "Один профиль процесса и материал применяются ко всей пластине. "
             "Для нависаний нужен вариант с древовидными поддержками. "
             "Нагрузку указывай трёхмерным вектором в осях исходного STL. "
             "При правке сохраняй ранее заданное направление, если его не просят менять. "
@@ -177,7 +192,7 @@ async def run_workflow(job_id, folder, revision, prompt, progress, previous=None
                 spec = {"type": "function", "function": {
                     "name": step, "description": tool.description, "parameters": schema,
                 }}
-                message = await ask(llm, messages, spec)
+                message = await ask(llm, messages, spec, tool_choice)
                 try:
                     call, = message["tool_calls"]
                     if call["function"]["name"] != step:

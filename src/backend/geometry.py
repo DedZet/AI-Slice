@@ -1,5 +1,6 @@
 """Mesh analysis in model coordinates and orientation scoring in plate millimeters."""
 import numpy as np
+import shapely
 import trimesh
 
 from contracts import Profile, WorkflowError
@@ -119,7 +120,7 @@ def pose(mesh, profile, rotation):
     return matrix
 
 
-def orientations(mesh, profile, load_model_xyz):
+def orientations(mesh, profile, load_model_xyz, *, free_yaw=False, priority="balanced"):
     load = np.asarray(load_model_xyz, dtype=float)
     length = np.linalg.norm(load)
     if not np.isfinite(length) or length > 1e6 or (0 < length < EPS):
@@ -128,9 +129,22 @@ def orientations(mesh, profile, load_model_xyz):
         load /= length
     capacity = np.asarray(profile.bed_size_mm) - [2 * profile.margin_mm, 2 * profile.margin_mm, 0]
     choices = []
-    for index, up in enumerate(AXES):
+    # Broad planar faces can make good bases even when the STL axes are tilted.
+    normal_bins = {}
+    for normal, area in zip(mesh.face_normals, mesh.area_faces):
+        key = tuple(np.round(normal, decimals=2))
+        weight, direction = normal_bins.get(key, (0., normal))
+        normal_bins[key] = (weight + area, direction)
+    directions = list(AXES)
+    for _, normal in sorted(normal_bins.values(), key=lambda item: -item[0])[:16]:
+        if all(float(-normal @ up) < .99999999 for up in directions):
+            directions.append(-normal)
+    contact_weight, support_weight = {
+        "balanced": (2, 3), "stability": (4, 3), "min-support": (2, 6),
+    }[priority]
+    for index, up in enumerate(directions):
         align = trimesh.geometry.align_vectors(up, UP)[:3, :3]
-        for quarter_turn in range(2):
+        for quarter_turn in range(1 if free_yaw else 2):
             turn = trimesh.transformations.rotation_matrix(quarter_turn * np.pi / 2, UP)[:3, :3]
             rotation = turn @ align
             matrix = pose(mesh, profile, rotation)
@@ -144,16 +158,38 @@ def orientations(mesh, profile, load_model_xyz):
             overhang_area = float(np.sum(placed.area_faces[suspended]))
             load_z = float(abs((rotation @ load)[2]))
             contact_ratio = min(1., contact_area / max(EPS, np.prod(placed.extents[:2])))
-            score = 2 * contact_ratio - 3 * overhang_area / placed.area - 2 * load_z
-            if not (placed.extents <= capacity + EPS).all():
+            # The downward projection times distance from the bed is an
+            # estimate used to rank poses, not the final amount of support.
+            support_proxy = float(np.sum(
+                placed.area_faces[suspended] * down[suspended] * triangles[suspended, :, 2].mean(axis=1)
+            ))
+            base_faces = triangles[contact]
+            center = placed.center_mass
+            stability = 0.
+            if len(base_faces):
+                base = shapely.multipoints(base_faces[:, :, :2].reshape(-1, 2))
+                hull = shapely.convex_hull(base)
+                projected_center = shapely.Point(center[:2])
+                edge = (hull.boundary.distance(projected_center) if hull.covers(projected_center)
+                        else -hull.distance(projected_center))
+                stability = min(1., max(-1., edge / max(center[2], EPS)))
+            score = (
+                contact_weight * (contact_ratio + .35 * stability)
+                - support_weight * (overhang_area / placed.area + support_proxy / (placed.area * max(placed.extents[2], EPS)))
+                - 2 * load_z
+            )
+            fits = (placed.extents <= capacity + EPS).all()
+            if free_yaw:
+                fits = placed.extents[2] <= capacity[2] + EPS
+            if not fits:
                 continue
             choices.append({
                 "id": f"pose-{index}-{quarter_turn}",
                 "model_to_plate": matrix.tolist(),
                 "extents_mm": placed.extents.tolist(),
-                "bridge": bridge_candidates(placed, suspended, profile),
                 "contact_mm2": contact_area,
                 "overhang_mm2": overhang_area,
+                "support_proxy_mm3": support_proxy,
                 "load_normal_fraction": load_z,
                 "center_of_mass_plate_mm": placed.center_mass.tolist(),
                 "score": float(score),
@@ -162,3 +198,10 @@ def orientations(mesh, profile, load_model_xyz):
     if not valid:
         raise WorkflowError("DOES_NOT_FIT", "Модель не помещается в пределах профиля ни в одной ориентации.")
     return valid
+
+
+def measure_bridges(mesh, profile):
+    suspended = (mesh.triangles[:, :, 2] > EPS).any(axis=1) & (
+        -mesh.face_normals[:, 2] > np.sin(np.deg2rad(profile.overhang_deg_from_vertical))
+    )
+    return bridge_candidates(mesh, suspended, profile)

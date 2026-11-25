@@ -1,15 +1,16 @@
 """MCP adapter. Each stdio process handles one API-created job."""
 import os
 from functools import wraps
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import numpy as np
+import trimesh
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
 from contracts import Slug, WorkflowError, job_dir, load_profile, process_summary, read_json, save_json
-from geometry import EPS, inspect, mesh_from_stl, orientations
+from geometry import EPS, inspect, measure_bridges, mesh_from_stl, orientations
 from orca import run_orca, write_plate
 
 mcp = MCPServer("AI-SLICE")
@@ -39,11 +40,34 @@ def previous(folder, filename):
         raise WorkflowError("STEP_ORDER", "Сначала выполните предыдущий этап.") from exc
 
 
+def model_meshes(folder):
+    names = previous(folder.parent, "status.json").get("models", ["Модель 1"])
+    for index, name in enumerate(names):
+        source = "source.stl" if index == 0 else f"source-{index + 1}.stl"
+        try:
+            yield name, mesh_from_stl(folder.parent / source)
+        except WorkflowError as exc:
+            raise WorkflowError(exc.code, f"Модель {index + 1} ({name}). {exc}") from exc
+
+
 @operation
 def inspect_model(job_id: UUID) -> dict[str, Any]:
     """Validate STL and measure model bounds, volume, mass center and sampled walls."""
     folder = folder_for(job_id)
-    data = inspect(mesh_from_stl(folder.parent / "source.stl"), load_profile(folder / "profile"))
+    profile = load_profile(folder / "profile")
+    models = [
+        {"model_id": index, "name": name, **inspect(mesh, profile)}
+        for index, (name, mesh) in enumerate(model_meshes(folder))
+    ]
+    if len(models) == 1:
+        data = models[0]
+    else:
+        walls = [model["min_sampled_wall_mm"] for model in models if model["min_sampled_wall_mm"] is not None]
+        data = {
+            "models": models,
+            "min_sampled_wall_mm": min(walls, default=None),
+            "thin_wall_samples": sum(model["thin_wall_samples"] for model in models),
+        }
     save_json(folder / "geometry.json", data)
     return data
 
@@ -51,15 +75,39 @@ def inspect_model(job_id: UUID) -> dict[str, Any]:
 @operation
 def analyze_orientations(
     job_id: UUID, load_model_xyz: tuple[float, float, float] = (0, 0, 0),
+    priority: Literal["balanced", "stability", "min-support"] = "balanced",
 ) -> dict[str, Any]:
-    """Rank printable plate poses. Use model coordinates for load; zero means unknown."""
+    """Rank poses by contact, stability and overhang; pack multiple models on one plate."""
     folder = folder_for(job_id)
     previous(folder, "geometry.json")
     profile = load_profile(folder / "profile")
-    mesh = mesh_from_stl(folder.parent / "source.stl")
-    choices = orientations(mesh, profile, load_model_xyz)
-    save_json(folder / "orientations.json", {"load_model_xyz": load_model_xyz, "choices": choices})
-    brief = [{key: value for key, value in item.items() if key != "model_to_plate"} for item in choices]
+    models = list(model_meshes(folder))
+    multi = len(models) > 1
+    ranked = [
+        orientations(mesh, profile, load_model_xyz, free_yaw=multi, priority=priority)
+        for _, mesh in models
+    ]
+    choices = ranked[0]
+    if multi:
+        from nesting import MIN_GAP_MM, pack
+
+        parts = pack([mesh for _, mesh in models], ranked, profile)
+        for part, (name, _) in zip(parts, models, strict=True):
+            part["name"] = name
+        choices = [{
+            "id": "layout-1", "parts": parts, "minimum_gap_mm": MIN_GAP_MM,
+            **{key: sum(part[key] for part in parts) for key in
+               ("contact_mm2", "overhang_mm2", "support_proxy_mm3", "score")},
+        }]
+    save_json(folder / "orientations.json", {"load_model_xyz": load_model_xyz, "priority": priority, "choices": choices})
+    brief = []
+    for choice in choices:
+        item = {key: value for key, value in choice.items() if key not in {"model_to_plate", "parts"}}
+        if multi:
+            item["parts"] = [
+                {key: value for key, value in part.items() if key != "model_to_plate"} for part in choice["parts"]
+            ]
+        brief.append(item)
     return {"orientations": brief}
 
 
@@ -82,6 +130,9 @@ def set_parameters(
         "material": profile.material, "printer": profile.printer, "bed_type": profile.bed_type,
         "variant": variant.model_dump(mode="json", exclude={"process"}), "orientation": pose,
         "load_model_xyz": data["load_model_xyz"], "rationale": rationale,
+        "layout_priority": data.get("priority", "balanced"),
+        "bed_origin_mm": profile.bed_origin_mm,
+        "bed_size_mm": profile.bed_size_mm,
         "settings": process_summary(folder / "profile", variant.id),
     }
     save_json(folder / "project.json", project)
@@ -94,16 +145,25 @@ def preview_model(job_id: UUID) -> dict[str, Any]:
     folder = folder_for(job_id)
     geometry = previous(folder, "geometry.json")
     project = previous(folder, "project.json")
-    mesh = mesh_from_stl(folder.parent / "source.stl")
-    mesh.apply_transform(np.asarray(project["orientation"]["model_to_plate"]))
-    write_plate(folder / "plate.3mf", mesh)
-    mesh.export(folder / "preview.stl")
+    orientation = project["orientation"]
+    parts = orientation.get("parts", [orientation])
+    profile = load_profile(folder / "profile")
+    meshes = []
+    bridges = []
+    for part, (_, mesh) in zip(parts, model_meshes(folder), strict=True):
+        mesh.apply_transform(np.asarray(part["model_to_plate"]))
+        bridges.append(measure_bridges(mesh, profile))
+        meshes.append(mesh)
+    write_plate(folder / "plate.3mf", meshes)
+    trimesh.util.concatenate(meshes).export(folder / "preview.stl")
     risks = []
     if geometry["thin_wall_samples"]:
         risks.append("В выборке найдены участки тоньше порога профиля.")
-    if project["orientation"]["contact_mm2"] <= EPS:
-        risks.append("Плоский контакт со столом практически отсутствует.")
-    bridge = project["orientation"]["bridge"]
+    if any(part["contact_mm2"] <= EPS for part in parts):
+        risks.append("У одной или нескольких деталей почти нет плоского контакта со столом.")
+    spans = [entry["max_sampled_bridge_mm"] for entry in bridges if entry["max_sampled_bridge_mm"] is not None]
+    bridge = {"bridge_samples": sum(entry["bridge_samples"] for entry in bridges),
+              "max_sampled_bridge_mm": max(spans, default=None)}
     if bridge["bridge_samples"]:
         risks.append("Найдены возможные мосты. Проверьте их после нарезки.")
     return {"risks": risks, "bridge": bridge}
@@ -117,7 +177,8 @@ def slice_model(job_id: UUID) -> dict[str, Any]:
     state = previous(folder.parent, "status.json")
     if state.get("approved_revision") != state.get("revision") or state["status"] != "slicing" or state["revision"] != int(os.environ["AISLICE_REVISION"]):
         raise WorkflowError("APPROVAL_REQUIRED", "Эта версия плана ещё не подтверждена.")
-    data = {"metrics": run_orca(folder, project["variant"]["id"])}
+    count = len(project["orientation"].get("parts", [project["orientation"]]))
+    data = {"metrics": run_orca(folder, project["variant"]["id"], model_count=count)}
     if any(value is None for value in data["metrics"].values()):
         data["slice_warning"] = "OrcaSlicer не предоставил все метрики в распознаваемом формате."
     save_json(folder / "result.json", data)
