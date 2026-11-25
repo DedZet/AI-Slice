@@ -18,3 +18,10 @@ button:disabled { opacity: .6; cursor: default; }
 .metrics dd { margin: 0; font-weight: 600; }
 .downloads { display: flex; flex-wrap: wrap; gap: 1rem; }
 [role="alert"] { color: #a02318; overflow-wrap: anywhere; }
+
+.preview { margin: 1rem 0; }
+.preview-canvas { height: clamp(16rem, 42vw, 24rem); border-radius: .6rem; overflow: hidden; background: #e8f0eb; }
+.preview-canvas canvas { display: block; touch-action: none; }
+.preview figcaption { margin-top: .45rem; font-size: .87rem; color: #3d5750; }
+.assistant-message { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 1rem 1rem 0; }
+.revision-form { display: grid; gap: .7rem; margin-top: 1rem; }

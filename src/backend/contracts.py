@@ -20,6 +20,12 @@ def configured_path(key: str, default: str) -> Path:
 JOBS = configured_path("JOBS_ROOT", "jobs")
 PROFILES = configured_path("PROFILES_ROOT", "profiles")
 ARTIFACTS = ("result.gcode.3mf", "result.gcode")
+BED_TEMPERATURES = {
+    "Cool Plate": "cool_plate_temp",
+    "Textured PEI Plate": "textured_plate_temp",
+    "Engineering Plate": "eng_plate_temp",
+    "High Temp Plate": "hot_plate_temp",
+}
 Slug = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")]
 Positive = Annotated[float, Field(gt=0, le=2000)]
 
@@ -38,7 +44,8 @@ class Variant(Contract):
 
 class Profile(Contract):
     printer: str
-    material: Literal["PLA", "PETG", "ABS"]
+    material: Literal["PLA", "PETG", "ABS", "ASA", "TPU", "PC", "PA"]
+    bed_type: Literal["Cool Plate", "Textured PEI Plate", "Engineering Plate", "High Temp Plate"] | None = None
     machine: str
     filament: str
     # A verified printable rectangle, in the Orca plate coordinate system.
@@ -77,6 +84,11 @@ def load_profile(folder: Path) -> Profile:
     return Profile.model_validate(read_json(folder / "profile.json"))
 
 
+def process_summary(folder: Path, variant_id: str) -> dict:
+    process = read_json(folder / f"process-{variant_id}.json")
+    return {key: process.get(key) for key in ("layer_height", "wall_loops", "sparse_infill_pattern", "outer_wall_speed")}
+
+
 def preset(folder: Path, filename: str, kind: str) -> dict:
     if Path(filename).name != filename or Path(filename).suffix != ".json" or ";" in filename:
         raise ValueError("Invalid preset filename")
@@ -108,14 +120,23 @@ def validate_bed(profile: Profile, machine: dict) -> None:
         raise ValueError("Catalog build volume exceeds Orca machine preset")
 
 
-def checked_profile(folder: Path) -> tuple[Profile, dict, dict, dict[str, dict]]:
+def profile_manifests():
+    for manifest in sorted(PROFILES.glob("*/profile*.json")):
+        suffix = manifest.stem.removeprefix("profile")
+        if not suffix or suffix.startswith("-"):
+            yield manifest.parent.name + suffix, manifest
+
+
+def checked_profile(folder: Path, manifest_name: str = "profile.json") -> tuple[Profile, dict, dict, dict[str, dict]]:
     try:
-        profile = load_profile(folder)
+        profile = Profile.model_validate(read_json(folder / manifest_name))
         machine = preset(folder, profile.machine, "machine")
         filament = preset(folder, profile.filament, "filament")
         validate_bed(profile, machine)
         if filament["filament_type"] != [profile.material]:
             raise ValueError("Filament type differs from catalog")
+        if profile.bed_type and float(filament[BED_TEMPERATURES[profile.bed_type]][0]) <= 0:
+            raise ValueError("Filament preset does not support this build plate")
         if 2 * profile.margin_mm >= min(profile.bed_size_mm[:2]):
             raise ValueError("Margin leaves no printable area")
         processes = {}
@@ -133,15 +154,23 @@ def checked_profile(folder: Path) -> tuple[Profile, dict, dict, dict[str, dict]]
             ):
                 raise ValueError("Variant metadata differs from the Orca process preset")
             processes[variant.id] = process
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
         raise WorkflowError("INVALID_PROFILE", "Профиль отсутствует или содержит несогласованные настройки.") from exc
     return profile, machine, filament, processes
 
 
 def snapshot_profile(profile_id: str, destination: Path) -> None:
-    profile, machine, filament, processes = checked_profile(PROFILES / profile_id)
+    matches = [path for key, path in profile_manifests() if key == profile_id]
+    if len(matches) != 1:
+        raise WorkflowError("INVALID_PROFILE", "Профиль отсутствует или его идентификатор продублирован.")
+    manifest = matches[0]
+    profile, machine, filament, processes = checked_profile(manifest.parent, manifest.name)
     destination.mkdir()
-    save_json(destination / "profile.json", profile.model_dump(mode="json"))
+    snapshot = profile.model_dump(mode="json")
+    snapshot.update(machine="machine.json", filament="filament.json")
+    for variant in snapshot["variants"]:
+        variant["process"] = f"process-{variant['id']}.json"
+    save_json(destination / "profile.json", snapshot)
     save_json(destination / "machine.json", machine)
     save_json(destination / "filament.json", filament)
     for variant_id, process in processes.items():

@@ -3,12 +3,14 @@ import os
 import re
 import shutil
 import subprocess
+from pathlib import Path
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 
-from contracts import WorkflowError
+from contracts import WorkflowError, load_profile
 
 TIMEOUT_SECONDS = 300
 CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+PROGRAM_FILES_KEYS = ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)")
 
 
 def write_plate(path, mesh):
@@ -62,13 +64,42 @@ def metrics(path):
     return result
 
 
+def find_orca() -> Path:
+    configured = os.getenv("ORCA_SLICER_BIN", "").strip()
+    if configured:
+        path = Path(configured)
+        if path.is_absolute() and path.is_file() and os.access(path, os.X_OK):
+            return path
+        raise WorkflowError(
+            "ORCA_NOT_CONFIGURED",
+            "ORCA_SLICER_BIN должен указывать абсолютный путь к исполняемому файлу OrcaSlicer.",
+        )
+
+    name = "orca-slicer.exe" if os.name == "nt" else "orca-slicer"
+    directories = [Path(entry) for entry in os.get_exec_path()]
+    if os.name == "nt":
+        for key in PROGRAM_FILES_KEYS:
+            if root := os.getenv(key):
+                directories.append(Path(root) / "OrcaSlicer")
+    for directory in directories:
+        if directory.is_absolute():
+            path = directory / name
+            if path.is_file() and os.access(path, os.X_OK):
+                return path
+    raise WorkflowError(
+        "ORCA_NOT_CONFIGURED",
+        "Установите OrcaSlicer на машине с MCP или укажите путь в ORCA_SLICER_BIN.",
+    )
+
+
 def run_orca(folder, variant_id):
-    executable = os.getenv("ORCA_SLICER_BIN", "")
-    if not executable or not os.path.isabs(executable) or not os.path.isfile(executable):
-        raise WorkflowError("ORCA_NOT_CONFIGURED", "Задайте абсолютный путь к OrcaSlicer.")
+    executable = find_orca()
     output = folder / "output"
     output.mkdir(exist_ok=True)
     archive_path = output / "result.gcode.3mf"
+    gcode_path = output / "result.gcode"
+    archive_path.unlink(missing_ok=True)
+    gcode_path.unlink(missing_ok=True)
     args = [
         executable, "plate.3mf",
         "--load-settings", f"profile/process-{variant_id}.json;profile/machine.json",
@@ -76,6 +107,9 @@ def run_orca(folder, variant_id):
         "--datadir", "orca-data", "--arrange", "0", "--orient", "0",
         "--slice", "0", "--outputdir", "output", "--export-3mf", archive_path.name,
     ]
+    bed_type = load_profile(folder / "profile").bed_type
+    if bed_type:
+        args.append(f"--curr-bed-type={bed_type}")
     try:
         with (folder / "orca.log").open("wb") as log:
             result = subprocess.run(
@@ -92,7 +126,6 @@ def run_orca(folder, variant_id):
         if os.name == "nt" and code >= 2**31:
             code -= 2**32
         raise WorkflowError("ORCA_FAILED", f"OrcaSlicer завершился с кодом {code}.")
-    gcode_path = output / "result.gcode"
     try:
         with ZipFile(archive_path) as archive:
             entries = [item for item in archive.infolist() if item.filename.lower().endswith(".gcode")]

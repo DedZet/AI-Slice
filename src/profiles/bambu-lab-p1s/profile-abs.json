@@ -1,0 +1,78 @@
+{
+  "printer": "Bambu Lab P1S · 0.4 mm",
+  "material": "ABS",
+  "bed_type": "Textured PEI Plate",
+  "machine": "machine.json",
+  "filament": "filament-abs.json",
+  "bed_origin_mm": [
+    18.0,
+    0.0
+  ],
+  "bed_size_mm": [
+    238.0,
+    256.0,
+    250.0
+  ],
+  "margin_mm": 5,
+  "overhang_deg_from_vertical": 45,
+  "min_wall_mm": 0.8,
+  "max_bridge_mm": 15,
+  "variants": [
+    {
+      "id": "balanced",
+      "process": "balanced.json",
+      "priority": "balanced",
+      "infill_pct": 20,
+      "supports": "none"
+    },
+    {
+      "id": "balanced-tree",
+      "process": "balanced-tree.json",
+      "priority": "balanced",
+      "infill_pct": 20,
+      "supports": "tree"
+    },
+    {
+      "id": "strength",
+      "process": "strength.json",
+      "priority": "strength",
+      "infill_pct": 40,
+      "supports": "none"
+    },
+    {
+      "id": "strength-tree",
+      "process": "strength-tree.json",
+      "priority": "strength",
+      "infill_pct": 40,
+      "supports": "tree"
+    },
+    {
+      "id": "quality",
+      "process": "quality.json",
+      "priority": "quality",
+      "infill_pct": 15,
+      "supports": "none"
+    },
+    {
+      "id": "quality-tree",
+      "process": "quality-tree.json",
+      "priority": "quality",
+      "infill_pct": 15,
+      "supports": "tree"
+    },
+    {
+      "id": "speed",
+      "process": "speed.json",
+      "priority": "speed",
+      "infill_pct": 10,
+      "supports": "none"
+    },
+    {
+      "id": "speed-tree",
+      "process": "speed-tree.json",
+      "priority": "speed",
+      "infill_pct": 10,
+      "supports": "tree"
+    }
+  ]
+}

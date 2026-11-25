@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
@@ -9,8 +10,10 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 
-from agent import run_workflow
-from contracts import ARTIFACTS, JOBS, PROFILES, Slug, WorkflowError, checked_profile, job_dir, read_json, save_json, snapshot_profile
+from pydantic import Field
+
+from agent import run_workflow, slice_workflow
+from contracts import ARTIFACTS, Contract, JOBS, Slug, WorkflowError, checked_profile, job_dir, profile_manifests, read_json, save_json, snapshot_profile
 
 MAX_UPLOAD = 16 * 1024**2
 logger = logging.getLogger(__name__)
@@ -22,9 +25,13 @@ async def lifespan(app: FastAPI):
     app.state.worker = asyncio.Semaphore(1)
     for path in JOBS.glob("*/status.json"):
         state = read_json(path)
-        if state["status"] in {"uploading", "queued", "running"}:
-            save_json(path, {**state, "status": "failed", "error": {
-                "code": "INTERRUPTED", "message": "Задача прервана перезапуском сервера. Загрузите модель повторно.",
+        if state["status"] in {"uploading", "queued", "running", "slicing"}:
+            interrupted_slice = state["status"] == "slicing"
+            save_json(path, {**state, "status": "review" if interrupted_slice else "failed", "error": {
+                "code": "INTERRUPTED", "message": (
+                    "Нарезка прервана. Можно подтвердить план снова." if interrupted_slice
+                    else "Подготовка прервана перезапуском сервера."
+                ),
             }})
     yield
 
@@ -45,17 +52,17 @@ def health_check():
 @app.get("/api/profiles")
 def list_profiles():
     profiles = []
-    for folder in sorted(PROFILES.glob("*/profile.json")):
+    for profile_id, manifest in profile_manifests():
         try:
-            profile, _, _, _ = checked_profile(folder.parent)
+            profile, _, _, _ = checked_profile(manifest.parent, manifest.name)
         except WorkflowError:
-            logger.warning("Invalid profile catalog entry: %s", folder)
+            logger.warning("Invalid profile catalog entry: %s", manifest)
             continue
         profiles.append({
-            "id": folder.parent.name, "printer": profile.printer, "material": profile.material,
+            "id": profile_id, "printer": profile.printer, "material": profile.material,
             "variants": [value.model_dump(exclude={"process"}) for value in profile.variants],
         })
-    return profiles
+    return sorted(profiles, key=lambda value: (value["printer"], value["material"] != "PLA", value["material"]))
 
 
 def job_state(job_id: UUID):
@@ -65,7 +72,7 @@ def job_state(job_id: UUID):
         raise HTTPException(404, "Задача не найдена.") from exc
 
 
-async def prepare(job_id: UUID, prompt: str):
+async def prepare(job_id: UUID, slicing: bool = False):
     folder = job_dir(job_id)
     path = folder / "status.json"
     state = read_json(path)
@@ -73,18 +80,31 @@ async def prepare(job_id: UUID, prompt: str):
     def progress(step):
         save_json(path, {**state, "status": "running", "step": step})
 
+    revision = state["revision"]
+    failure_status = "review" if slicing else "failed"
     async with app.state.worker:
         try:
-            result = await run_workflow(job_id, folder, prompt, progress)
-            save_json(path, {**state, "status": "review", "result": result})
+            if slicing:
+                sliced = await slice_workflow(job_id, revision)
+                save_json(path, {
+                    **state, "status": "approved", "result": {**state["result"], **sliced},
+                    "artifacts": list(ARTIFACTS),
+                })
+            else:
+                result = await run_workflow(
+                    job_id, folder, revision, state["prompt"], progress,
+                    previous=state.get("result", {}).get("project"), history=state.get("history", []),
+                )
+                save_json(path, {**state, "status": "review", "result": {**result, "revision": revision}})
+
         except* WorkflowError as errors:
             exc = errors.exceptions[0]
             while isinstance(exc, BaseExceptionGroup):
                 exc = exc.exceptions[0]
-            save_json(path, {**state, "status": "failed", "error": {"code": exc.code, "message": str(exc)}})
+            save_json(path, {**state, "status": failure_status, "error": {"code": exc.code, "message": str(exc)}})
         except* Exception:
             logger.exception("Job %s failed", job_id)
-            save_json(path, {**state, "status": "failed", "error": {
+            save_json(path, {**state, "status": failure_status, "error": {
                 "code": "INTERNAL", "message": "Внутренняя ошибка подготовки модели.",
             }})
 
@@ -104,7 +124,7 @@ async def create_job(
     job_id = uuid4()
     folder = job_dir(job_id)
     folder.mkdir()
-    state = {"job_id": str(job_id), "status": "uploading", "profile_id": profile_id, "prompt": prompt.strip()}
+    state = {"job_id": str(job_id), "status": "uploading", "revision": 1, "profile_id": profile_id, "prompt": prompt.strip()}
     path = folder / "status.json"
     save_json(path, state)
     try:
@@ -120,7 +140,9 @@ async def create_job(
                 stream.write(chunk)
         if total == 0:
             raise HTTPException(422, "Файл STL пуст.")
-        await run_in_threadpool(snapshot_profile, profile_id, folder / "profile")
+        revision_folder = folder / "rev-1"
+        revision_folder.mkdir()
+        await run_in_threadpool(snapshot_profile, profile_id, revision_folder / "profile")
     except WorkflowError as exc:
         save_json(path, {**state, "status": "failed", "error": {"code": exc.code, "message": str(exc)}})
         raise HTTPException(422, {"code": exc.code, "message": str(exc)}) from exc
@@ -132,7 +154,7 @@ async def create_job(
         await model.close()
     state["status"] = "queued"
     save_json(path, state)
-    background.add_task(prepare, job_id, state["prompt"])
+    background.add_task(prepare, job_id)
     return state
 
 
@@ -141,16 +163,74 @@ async def status(job_id: UUID):
     return job_state(job_id)
 
 
-@app.post("/api/jobs/{job_id}/approve")
-async def approve(job_id: UUID):
+class Approval(Contract):
+    revision: Annotated[int, Field(ge=1)]
+
+
+class RevisionRequest(Approval):
+    prompt: Annotated[str, Field(min_length=1, max_length=4000)]
+    profile_id: Slug | None = None
+
+
+@app.post("/api/jobs/{job_id}/revise", status_code=202)
+async def revise(job_id: UUID, change: RevisionRequest, background: BackgroundTasks):
     state = job_state(job_id)
-    if state["status"] not in {"review", "approved"}:
-        raise HTTPException(409, "Результат ещё недоступен для подтверждения.")
-    if state["status"] == "review":
-        state["status"] = "approved"
-        state["artifacts"] = list(ARTIFACTS)
-        save_json(job_dir(job_id) / "status.json", state)
+    if state["status"] not in {"review", "failed"} or state.get("revision") != change.revision:
+        raise HTTPException(409, "Обновите задачу, чтобы редактировать текущую версию.")
+    if not change.prompt.strip():
+        raise HTTPException(422, "Опишите, что нужно изменить.")
+    if change.revision >= 20:
+        raise HTTPException(409, "Достигнут лимит версий задачи.")
+    history = [*state.get("history", []), {"role": "user", "content": state["prompt"]}]
+    result = state.get("result")
+    if result and result["revision"] == change.revision:
+        history.append({"role": "assistant", "content": result["message"]})
+    revision = change.revision + 1
+    folder = job_dir(job_id)
+    revision_folder = folder / f"rev-{revision}"
+    revision_folder.mkdir(exist_ok=True)
+    current_profile = folder / f"rev-{change.revision}" / "profile"
+    profile_id = change.profile_id or state["profile_id"]
+    try:
+        if profile_id == state["profile_id"] and current_profile.is_dir():
+            shutil.copytree(current_profile, revision_folder / "profile")
+        else:
+            snapshot_profile(profile_id, revision_folder / "profile")
+    except WorkflowError as exc:
+        raise HTTPException(422, {"code": exc.code, "message": str(exc)}) from exc
+    state.pop("error", None)
+    state.pop("approved_revision", None)
+    state.update(status="queued", revision=revision, profile_id=profile_id, prompt=change.prompt.strip(), history=history)
+    save_json(folder / "status.json", state)
+    background.add_task(prepare, job_id)
     return state
+
+
+@app.post("/api/jobs/{job_id}/approve", status_code=202)
+async def approve(job_id: UUID, approval: Approval, background: BackgroundTasks):
+    state = job_state(job_id)
+    if state.get("revision") != approval.revision:
+        raise HTTPException(409, "Версия плана изменилась. Проверьте актуальный предпросмотр.")
+    if state["status"] in {"slicing", "approved"}:
+        return state
+    if state["status"] != "review":
+        raise HTTPException(409, "План ещё недоступен для подтверждения.")
+    state.pop("error", None)
+    state.update(status="slicing", approved_revision=approval.revision, step="slice_model")
+    save_json(job_dir(job_id) / "status.json", state)
+    background.add_task(prepare, job_id, slicing=True)
+    return state
+
+
+@app.get("/api/jobs/{job_id}/preview/{revision}.stl")
+async def preview(job_id: UUID, revision: int):
+    state = job_state(job_id)
+    if not 1 <= revision <= state.get("result", {}).get("revision", 0):
+        raise HTTPException(404, "Предпросмотр не найден.")
+    path = job_dir(job_id) / f"rev-{revision}" / "preview.stl"
+    if not path.is_file():
+        raise HTTPException(404, "Предпросмотр не найден.")
+    return FileResponse(path, media_type="model/stl")
 
 
 @app.get("/api/jobs/{job_id}/artifacts/{name}")
@@ -160,7 +240,10 @@ async def artifact(job_id: UUID, name: str):
         raise HTTPException(404, "Артефакт не найден.")
     if state["status"] != "approved":
         raise HTTPException(409, "Подтвердите результат перед скачиванием.")
-    path = job_dir(job_id) / "output" / name
+    folder = job_dir(job_id)
+    if "revision" in state:
+        folder /= f"rev-{state['revision']}"
+    path = folder / "output" / name
     if not path.is_file():
         raise HTTPException(404, "Артефакт не найден.")
     return FileResponse(path, filename=name, media_type="application/octet-stream")

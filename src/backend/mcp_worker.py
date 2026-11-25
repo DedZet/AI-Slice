@@ -8,7 +8,7 @@ import numpy as np
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
-from contracts import Slug, WorkflowError, job_dir, load_profile, read_json, save_json
+from contracts import Slug, WorkflowError, job_dir, load_profile, process_summary, read_json, save_json
 from geometry import EPS, inspect, mesh_from_stl, orientations
 from orca import run_orca, write_plate
 
@@ -26,7 +26,7 @@ def operation(function):
 
 
 def folder_for(job_id: UUID):
-    folder = job_dir(job_id)
+    folder = job_dir(job_id) / f"rev-{int(os.environ['AISLICE_REVISION'])}"
     if str(job_id) != os.getenv("AISLICE_JOB_ID") or not (folder / "profile/profile.json").is_file():
         raise WorkflowError("JOB_NOT_FOUND", "Задача недоступна этому процессу MCP.")
     return folder
@@ -43,7 +43,7 @@ def previous(folder, filename):
 def inspect_model(job_id: UUID) -> dict[str, Any]:
     """Validate STL and measure model bounds, volume, mass center and sampled walls."""
     folder = folder_for(job_id)
-    data = inspect(mesh_from_stl(folder / "source.stl"), load_profile(folder / "profile"))
+    data = inspect(mesh_from_stl(folder.parent / "source.stl"), load_profile(folder / "profile"))
     save_json(folder / "geometry.json", data)
     return data
 
@@ -56,7 +56,7 @@ def analyze_orientations(
     folder = folder_for(job_id)
     previous(folder, "geometry.json")
     profile = load_profile(folder / "profile")
-    mesh = mesh_from_stl(folder / "source.stl")
+    mesh = mesh_from_stl(folder.parent / "source.stl")
     choices = orientations(mesh, profile, load_model_xyz)
     save_json(folder / "orientations.json", {"load_model_xyz": load_model_xyz, "choices": choices})
     brief = [{key: value for key, value in item.items() if key != "model_to_plate"} for item in choices]
@@ -79,47 +79,49 @@ def set_parameters(
     if pose["overhang_mm2"] > EPS and variant.supports == "none":
         raise WorkflowError("SUPPORT_REQUIRED", "Для выбранной ориентации требуется профиль с поддержками.")
     project = {
-        "material": profile.material, "printer": profile.printer,
+        "material": profile.material, "printer": profile.printer, "bed_type": profile.bed_type,
         "variant": variant.model_dump(mode="json", exclude={"process"}), "orientation": pose,
         "load_model_xyz": data["load_model_xyz"], "rationale": rationale,
+        "settings": process_summary(folder / "profile", variant.id),
     }
     save_json(folder / "project.json", project)
     return project
 
 
 @operation
-def slice_model(job_id: UUID) -> dict[str, Any]:
-    """Export the selected pose in plate millimeters and slice using the frozen profile."""
-    folder = folder_for(job_id)
-    project = previous(folder, "project.json")
-    mesh = mesh_from_stl(folder / "source.stl")
-    mesh.apply_transform(np.asarray(project["orientation"]["model_to_plate"]))
-    write_plate(folder / "plate.3mf", mesh)
-    data = {
-        "metrics": run_orca(folder, project["variant"]["id"]),
-        "bridge": project["orientation"]["bridge"],
-    }
-    save_json(folder / "result.json", data)
-    return data
-
-
-@operation
-def check_result(job_id: UUID) -> dict[str, Any]:
-    """Summarize geometric and metric warnings for the engineer."""
+def preview_model(job_id: UUID) -> dict[str, Any]:
+    """Prepare the oriented mesh and flag risks before asking the user to approve."""
     folder = folder_for(job_id)
     geometry = previous(folder, "geometry.json")
     project = previous(folder, "project.json")
-    result = previous(folder, "result.json")
+    mesh = mesh_from_stl(folder.parent / "source.stl")
+    mesh.apply_transform(np.asarray(project["orientation"]["model_to_plate"]))
+    write_plate(folder / "plate.3mf", mesh)
+    mesh.export(folder / "preview.stl")
     risks = []
     if geometry["thin_wall_samples"]:
         risks.append("В выборке найдены участки тоньше порога профиля.")
     if project["orientation"]["contact_mm2"] <= EPS:
         risks.append("Плоский контакт со столом практически отсутствует.")
-    if result["bridge"]["bridge_samples"]:
-        risks.append("Найдены возможные мосты. Проверьте их в предпросмотре OrcaSlicer.")
-    if any(value is None for value in result["metrics"].values()):
-        risks.append("OrcaSlicer не предоставил все метрики в распознаваемом формате.")
-    return {"risks": risks, **result}
+    bridge = project["orientation"]["bridge"]
+    if bridge["bridge_samples"]:
+        risks.append("Найдены возможные мосты. Проверьте их после нарезки.")
+    return {"risks": risks, "bridge": bridge}
+
+
+@operation
+def slice_model(job_id: UUID) -> dict[str, Any]:
+    """Slice a user-approved revision using its previously prepared plate."""
+    folder = folder_for(job_id)
+    project = previous(folder, "project.json")
+    state = previous(folder.parent, "status.json")
+    if state.get("approved_revision") != state.get("revision") or state["status"] != "slicing" or state["revision"] != int(os.environ["AISLICE_REVISION"]):
+        raise WorkflowError("APPROVAL_REQUIRED", "Эта версия плана ещё не подтверждена.")
+    data = {"metrics": run_orca(folder, project["variant"]["id"])}
+    if any(value is None for value in data["metrics"].values()):
+        data["slice_warning"] = "OrcaSlicer не предоставил все метрики в распознаваемом формате."
+    save_json(folder / "result.json", data)
+    return data
 
 
 if __name__ == "__main__":
