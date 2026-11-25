@@ -25,3 +25,4 @@ button:disabled { opacity: .6; cursor: default; }
 .preview figcaption { margin-top: .45rem; font-size: .87rem; color: #3d5750; }
 .assistant-message { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 1rem 1rem 0; }
 .revision-form { display: grid; gap: .7rem; margin-top: 1rem; }
+.revision-form[hidden] { display: none; }

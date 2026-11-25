@@ -179,7 +179,7 @@ export default function App() {
     event.preventDefault()
     const form = new FormData(event.currentTarget)
     if (form.getAll('model').length > 3) {
-      setError('Для одной пластины выберите до трёх файлов STL.')
+      setError('Для одной пластины выберите до трёх файлов моделей.')
       return
     }
     setPending(true)
@@ -218,15 +218,16 @@ export default function App() {
           <p className={message.role === 'user' ? 'user-message' : 'assistant-message'} key={index}>{message.content}</p>
         ))}
         <p className="user-message">{job.prompt}</p>
-        {job.models && job.models.length > 1 && <p>Файлы STL · {job.models.join(', ')}</p>}
+        {job.models && job.models.length > 1 && <p>Файлы моделей · {job.models.join(', ')}</p>}
         {live && <p role="status">{job.step ? stages[job.step] : 'Задача в очереди'}</p>}
         {job.error && <p role="alert">{job.error.message} ({job.error.code})</p>}
         {job.result && (job.result.revision === job.revision || job.status === 'approved') && <PrintReport result={job.result} jobId={job.job_id} />}
         {job.status === 'review' && job.result?.revision === job.revision && <button type="button" disabled={pending} onClick={() => void update('approve')}>Подтвердить и нарезать</button>}
-        {((job.status === 'review' && job.result?.revision === job.revision) ||
+          <form className="revision-form" key={`${job.job_id}:${job.result?.revision ?? 0}`} hidden={!(
+          (job.status === 'review' && job.result?.revision === job.revision) ||
           (job.status === 'failed' && (job.revision > 1 ||
-            ['DOES_NOT_FIT', 'PLATE_LAYOUT_NOT_FOUND', 'SUPPORT_REQUIRED'].includes(job.error?.code ?? '')))) && (
-          <form className="revision-form" key={job.revision} onSubmit={event => {
+            ['DOES_NOT_FIT', 'PLATE_LAYOUT_NOT_FOUND', 'SUPPORT_REQUIRED'].includes(job.error?.code ?? '')))
+        )} onSubmit={event => {
             event.preventDefault()
             const form = new FormData(event.currentTarget)
             const prompt = String(form.get('revision_prompt') ?? '').trim()
@@ -244,12 +245,13 @@ export default function App() {
             </label>
             <button disabled={pending}>Отправить правки</button>
           </form>
-        )}
         {job.artifacts && <div className="downloads">{job.artifacts.map(name =>
           <a key={name} href={`/api/jobs/${job.job_id}/artifacts/${name}`}>Скачать {name}</a>,
         )}</div>}
       </section>}
-      {(!job || job.status === 'approved' || (job.status === 'failed' && job.revision === 1) || (job.status === 'review' && !job.result?.revision)) && <form onSubmit={submit} className="composer">
+      <form onSubmit={submit} className="composer" hidden={!!job && !(
+        job.status === 'approved' || job.status === 'failed' || (job.status === 'review' && !job.result?.revision)
+      )}>
         <fieldset disabled={pending || live}>
           <label>Профиль принтера и материала
             <select name="profile_id" required value={profileId} onChange={event => setProfileId(event.target.value)}>
@@ -257,8 +259,8 @@ export default function App() {
               <ProfileOptions profiles={profiles} />
             </select>
           </label>
-          <label>Модели STL в миллиметрах · до 3 на одну пластину
-            <input type="file" name="model" accept=".stl" multiple required />
+          <label>Модели STL, 3MF или STEP · до 3 на одну пластину
+            <input type="file" name="model" accept=".stl,.3mf,.step,.stp" multiple required />
           </label>
           <label>Пожелания к печати
             <textarea name="prompt" rows={3} maxLength={4000} required
@@ -266,7 +268,7 @@ export default function App() {
           </label>
           <button disabled={!profileId}>Подготовить модель</button>
         </fieldset>
-      </form>}
+      </form>
       {error && <p role="alert">{error}</p>}
     </main>
   )

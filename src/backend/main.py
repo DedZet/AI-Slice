@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 from pydantic import Field
 
 from agent import run_workflow, slice_workflow
+from model_import import INPUT_SUFFIXES, source_path
 from contracts import ARTIFACTS, Contract, JOBS, Slug, WorkflowError, checked_profile, job_dir, profile_manifests, read_json, save_json, snapshot_profile
 
 MAX_UPLOAD = 16 * 1024**2
@@ -117,8 +118,9 @@ async def create_job(
     profile_id: Annotated[Slug, Form()],
     prompt: Annotated[str, Form(min_length=1, max_length=4000)],
 ):
-    if any(Path(file.filename or "").suffix.lower() != ".stl" for file in model):
-        raise HTTPException(415, "Поддерживается STL. Координаты интерпретируются как миллиметры.")
+    suffixes = [Path(file.filename or "").suffix.lower() for file in model]
+    if any(suffix not in INPUT_SUFFIXES for suffix in suffixes):
+        raise HTTPException(415, "Поддерживаются STL, 3MF, STEP и STP.")
     if not prompt.strip():
         raise HTTPException(422, "Введите пожелания к печати.")
 
@@ -128,22 +130,22 @@ async def create_job(
     names = [(file.filename or "").replace("\\", "/").rsplit("/", 1)[-1][:120] for file in model]
     state = {
         "job_id": str(job_id), "status": "uploading", "revision": 1,
-        "profile_id": profile_id, "prompt": prompt.strip(), "models": names,
+        "profile_id": profile_id, "prompt": prompt.strip(), "models": names, "model_suffixes": suffixes,
     }
     path = folder / "status.json"
     save_json(path, state)
     try:
-        for index, file in enumerate(model):
-            source = folder / ("source.stl" if index == 0 else f"source-{index + 1}.stl")
+        for index, (file, suffix) in enumerate(zip(model, suffixes, strict=True)):
+            source = source_path(folder, index, suffix)
             total = 0
             with source.open("wb") as stream:
                 while chunk := await file.read(256 * 1024):
                     total += len(chunk)
                     if total > MAX_UPLOAD:
-                        raise HTTPException(413, "Лимит одного STL составляет 16 МиБ.")
+                        raise HTTPException(413, "Лимит одного файла модели составляет 16 МиБ.")
                     stream.write(chunk)
             if total == 0:
-                raise HTTPException(422, "Один из файлов STL пуст.")
+                raise HTTPException(422, "Один из файлов моделей пуст.")
         revision_folder = folder / "rev-1"
         revision_folder.mkdir()
         await run_in_threadpool(snapshot_profile, profile_id, revision_folder / "profile")
@@ -151,8 +153,8 @@ async def create_job(
         save_json(path, {**state, "status": "failed", "error": {"code": exc.code, "message": str(exc)}})
         raise HTTPException(422, {"code": exc.code, "message": str(exc)}) from exc
     except HTTPException as exc:
-        for source in folder.glob("source*.stl"):
-            source.unlink()
+        for index, suffix in enumerate(suffixes):
+            source_path(folder, index, suffix).unlink(missing_ok=True)
         save_json(path, {**state, "status": "failed", "error": {"code": "UPLOAD_REJECTED", "message": exc.detail}})
         raise
     finally:

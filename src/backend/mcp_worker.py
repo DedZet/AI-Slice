@@ -11,6 +11,7 @@ from pydantic import Field
 
 from contracts import Slug, WorkflowError, job_dir, load_profile, process_summary, read_json, save_json
 from geometry import EPS, inspect, measure_bridges, mesh_from_stl, orientations
+from model_import import normalize_model, source_path
 from orca import run_orca, write_plate
 
 mcp = MCPServer("AI-SLICE")
@@ -41,11 +42,14 @@ def previous(folder, filename):
 
 
 def model_meshes(folder):
-    names = previous(folder.parent, "status.json").get("models", ["Модель 1"])
-    for index, name in enumerate(names):
-        source = "source.stl" if index == 0 else f"source-{index + 1}.stl"
+    state = previous(folder.parent, "status.json")
+    names = state.get("models", ["Модель 1"])
+    suffixes = state.get("model_suffixes", [".stl"] * len(names))
+    for index, (name, suffix) in enumerate(zip(names, suffixes, strict=True)):
+        target = source_path(folder.parent, index)
         try:
-            yield name, mesh_from_stl(folder.parent / source)
+            normalize_model(source_path(folder.parent, index, suffix), target)
+            yield name, mesh_from_stl(target)
         except WorkflowError as exc:
             raise WorkflowError(exc.code, f"Модель {index + 1} ({name}). {exc}") from exc
 
