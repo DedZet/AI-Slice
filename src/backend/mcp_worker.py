@@ -56,7 +56,7 @@ def model_meshes(folder):
 
 @operation
 def inspect_model(job_id: UUID) -> dict[str, Any]:
-    """Validate STL and measure model bounds, volume, mass center and sampled walls."""
+    """Validate geometry and measure bounds, volume, mass center and wall thickness across all faces."""
     folder = folder_for(job_id)
     profile = load_profile(folder / "profile")
     models = [
@@ -71,6 +71,10 @@ def inspect_model(job_id: UUID) -> dict[str, Any]:
             "models": models,
             "min_sampled_wall_mm": min(walls, default=None),
             "thin_wall_samples": sum(model["thin_wall_samples"] for model in models),
+            "wall_faces_probed": sum(model["wall_faces_probed"] for model in models),
+            "wall_faces_measured": sum(model["wall_faces_measured"] for model in models),
+            "wall_unresolved_samples": sum(model["wall_unresolved_samples"] for model in models),
+            "wall_probe_step_mm": max(model["wall_probe_step_mm"] for model in models),
         }
     save_json(folder / "geometry.json", data)
     return data
@@ -162,7 +166,9 @@ def preview_model(job_id: UUID) -> dict[str, Any]:
     trimesh.util.concatenate(meshes).export(folder / "preview.stl")
     risks = []
     if geometry["thin_wall_samples"]:
-        risks.append("В выборке найдены участки тоньше порога профиля.")
+        risks.append("Найдены участки стенок тоньше порога профиля.")
+    if geometry.get("wall_unresolved_samples"):
+        risks.append("Для части точек не удалось измерить толщину. Проверьте эти участки перед печатью.")
     if any(part["contact_mm2"] <= EPS for part in parts):
         risks.append("У одной или нескольких деталей почти нет плоского контакта со столом.")
     spans = [entry["max_sampled_bridge_mm"] for entry in bridges if entry["max_sampled_bridge_mm"] is not None]

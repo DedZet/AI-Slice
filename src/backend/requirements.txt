@@ -40,3 +40,4 @@ watchfiles==1.3.0
 websockets==17.4
 shapely==2.1.2
 cadquery-ocp-novtk==8.0.1.1.0
+embreex==4.4.0

@@ -11,7 +11,11 @@ type Result = {
   message: string
   mode: 'local' | 'api'
   risks: string[]
-  geometry: { min_sampled_wall_mm: number | null }
+  geometry: {
+    min_sampled_wall_mm: number | null
+    wall_faces_probed?: number
+    wall_faces_measured?: number
+  }
   bridge: { max_sampled_bridge_mm: number | null }
   project: {
     printer?: string
@@ -111,7 +115,10 @@ function PrintReport({ result, jobId }: { result: Result; jobId: string }) {
         <div><dt>Поддержки</dt><dd>{project.variant.supports === 'tree' ? 'Древовидные' : 'Выключены'}</dd></div>
         <div><dt>Контакт со столом</dt><dd><Measure value={project.orientation.contact_mm2} unit="мм²" /></dd></div>
         <div><dt>Площадь нависаний</dt><dd><Measure value={project.orientation.overhang_mm2} unit="мм²" /></dd></div>
-        <div><dt>Мин. толщина в выборке</dt><dd><Measure value={geometry.min_sampled_wall_mm} unit="мм" /></dd></div>
+        <div><dt>Мин. измеренная толщина</dt><dd><Measure value={geometry.min_sampled_wall_mm} unit="мм" /></dd></div>
+        {geometry.wall_faces_probed !== undefined && <div><dt>Грани с замером толщины</dt>
+          <dd>{geometry.wall_faces_measured?.toLocaleString('ru-RU')} из {geometry.wall_faces_probed.toLocaleString('ru-RU')}</dd>
+        </div>}
         {result.bridge.max_sampled_bridge_mm !== null && <div><dt>Пролёт моста в выборке</dt><dd><Measure value={result.bridge.max_sampled_bridge_mm} unit="мм" /></dd></div>}
       </dl>
       {parts && <details>

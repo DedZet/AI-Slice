@@ -4,6 +4,7 @@ import shapely
 import trimesh
 
 from contracts import Profile, WorkflowError
+from wall_analysis import measure_walls
 
 try:
     from igl import ray_mesh_intersect
@@ -77,20 +78,12 @@ def sample(indices, count):
 
 
 def inspect(mesh, profile: Profile):
-    thickness = []
-    for index in sample(np.arange(len(mesh.faces)), 48):
-        inward = -mesh.face_normals[index]
-        hit = first_hit(mesh, mesh.triangles_center[index] + inward * EPS, inward)
-        if np.isfinite(hit):
-            thickness.append(float(hit + EPS))
     return {
         "faces": len(mesh.faces),
         "bounds_model_mm": mesh.bounds.tolist(),
         "center_of_mass_model_mm": mesh.center_mass.tolist(),
         "volume_mm3": float(mesh.volume),
-        "wall_samples": len(thickness),
-        "min_sampled_wall_mm": min(thickness, default=None),
-        "thin_wall_samples": sum(value < profile.min_wall_mm for value in thickness),
+        **measure_walls(mesh, profile.min_wall_mm),
     }
 
 
