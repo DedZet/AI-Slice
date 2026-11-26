@@ -1,0 +1,11 @@
+.venv/
+venv/
+src/venv/
+__pycache__/
+*.pyc
+
+# Секреты
+.env
+
+# Временные файлы задач
+jobs/
